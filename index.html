@@ -382,11 +382,11 @@ table.score td:first-child{text-align:left}
 
 <div id="toast"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js" onerror="window.__peerFail=1"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js" onerror="window.__mqttFail=1"></script>
 <script>
 (function(){'use strict';
 /* ============================================================
-   РАЗЪЕБИ БАЗУ НАТО · один файл · P2P через PeerJS
+   РАЗЪЕБИ БАЗУ НАТО · один файл · P2P через WebRTC
    ============================================================ */
 const $=id=>document.getElementById(id);
 const clamp=(v,a,b)=>v<a?a:v>b?b:v, lerp=(a,b,t)=>a+(b-a)*t;
@@ -898,47 +898,90 @@ addEventListener('pointerdown',()=>{initAudio();if(AC&&AC.state==='suspended')AC
  el.addEventListener('pointerdown',on);el.addEventListener('pointerup',off);el.addEventListener('pointercancel',off);el.addEventListener('lostpointercapture',off);
  el.addEventListener('contextmenu',e=>e.preventDefault())});
 
-/* ---------- сеть ---------- */
-const net={peer:null,conn:null,isHost:false,code:null,ping:0,pingTimer:null,inp:{l:0,r:0,j:0,d:0,f:0,dr:0,tn:0},lastSent:0,lastSentStr:'',guestName:'',joinTimeout:null};
+/* ---------- сеть (WebRTC + MQTT-сигналинг) ---------- */
+const net={pc:null,conn:null,mqtt:null,isHost:false,code:null,cid:null,peerCid:null,ping:0,pingTimer:null,inp:{l:0,r:0,j:0,d:0,f:0,dr:0,tn:0},lastSent:0,lastSentStr:'',guestName:'',joinTimeout:null,offerTimer:null,remoteSet:false,iceBuf:[]};
 const CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function makeCode(){let s='';for(let i=0;i<4;i++)s+=CODE_CHARS[R()*CODE_CHARS.length|0];return s}
+function makeCid(){let s='';for(let i=0;i<9;i++)s+=CODE_CHARS[R()*CODE_CHARS.length|0];return s}
+const MQTT_URLS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+const ICE_SERVERS=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+ {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}];
 function netSend(o){if(net.conn&&net.conn.open){try{net.conn.send(o)}catch(e){}}}
-function cleanupNet(){clearInterval(net.pingTimer);clearTimeout(net.joinTimeout);
- try{net.conn&&net.conn.close()}catch(e){}try{net.peer&&net.peer.destroy()}catch(e){}
- net.peer=null;net.conn=null;net.code=null;net.ping=0;net.guestName='';$('pingChip').style.display='none'}
-function ensurePeerLib(){return new Promise((res,rej)=>{if(window.Peer)return res();
- const s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
- s.onload=()=>window.Peer?res():rej();s.onerror=()=>rej();document.head.appendChild(s);setTimeout(()=>window.Peer?res():rej(),9000)})}
-function peerErrMsg(t){return{'peer-unavailable':'Комната не найдена. Проверь код — хост должен держать вкладку открытой.',
- 'network':'Нет связи с сигнальным сервером. Проверь интернет.',
- 'server-error':'Сигнальный сервер недоступен. Попробуй через минуту.',
- 'socket-error':'Ошибка соединения с сервером сигнала.',
- 'browser-incompatible':'Браузер не поддерживает WebRTC.',
- 'unavailable-id':'Код занят, генерирую новый…'}[t]||('Ошибка связи: '+t)}
-function hostCreate(retry){if(retry===undefined)retry=0;
- showScreen('host');$('roomCode').textContent='····';$('hostStatus').className='status';$('hostStatus').textContent='Загрузка онлайн-модуля…';
- ensurePeerLib().then(()=>{net.isHost=true;const code=makeCode();net.code=code;
+/* адаптер: оборачивает RTCDataChannel в API, совместимый со старым кодом (как у PeerJS DataConnection) */
+function wrapDC(dc){const h={};
+ dc.addEventListener('open',()=>{(h.open||[]).forEach(f=>f())});
+ dc.addEventListener('message',e=>{let d;try{d=JSON.parse(e.data)}catch(_){d=e.data}(h.data||[]).forEach(f=>f(d))});
+ dc.addEventListener('close',()=>{(h.close||[]).forEach(f=>f())});
+ dc.addEventListener('error',()=>{(h.error||[]).forEach(f=>f())});
+ return{get open(){return dc.readyState==='open'},
+  send:o=>{if(dc.readyState==='open'){try{dc.send(JSON.stringify(o))}catch(e){}}},
+  on:(ev,f)=>{if(ev==='open'&&dc.readyState==='open'){setTimeout(f,0);return}(h[ev]=h[ev]||[]).push(f)},
+  close:()=>{try{dc.close()}catch(e){}}}};
+function cleanupNet(){clearInterval(net.pingTimer);clearTimeout(net.joinTimeout);clearInterval(net.offerTimer);
+ try{net.conn&&net.conn.close()}catch(e){}
+ try{net.pc&&net.pc.close()}catch(e){}
+ try{net.mqtt&&net.mqtt.end(true)}catch(e){}
+ net.pc=null;net.conn=null;net.mqtt=null;net.code=null;net.cid=null;net.peerCid=null;net.remoteSet=false;net.iceBuf=[];net.ping=0;net.guestName='';$('pingChip').style.display='none'}
+function ensureLib(){return new Promise((res,rej)=>{if(window.mqtt)return res();
+ const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js';
+ s.onload=()=>window.mqtt?res():rej();s.onerror=()=>rej();document.head.appendChild(s);setTimeout(()=>window.mqtt?res():rej(),10000)})}
+function mqttConnect(code,onMsg){const top='rbn-nato/'+code;
+ return new Promise((res,rej)=>{let idx=0,done=false;
+  const attempt=()=>{if(done)return;
+   if(idx>=MQTT_URLS.length){rej(new Error('no-broker'));return}
+   const url=MQTT_URLS[idx++];let client,settled=false;
+   const giveup=()=>{if(settled||done)return;settled=true;try{client&&client.end(true)}catch(e){};attempt()};
+   try{client=window.mqtt.connect(url,{clientId:'rbn-'+makeCid(),clean:true,connectTimeout:6000,reconnectPeriod:2500,resubscribe:true})}
+   catch(e){giveup();return}
+   client.on('connect',()=>{if(settled||done)return;settled=true;done=true;net.mqtt=client;
+    client.subscribe(top+'/host',{qos:1});client.subscribe(top+'/guest',{qos:1});
+    client.on('message',(t,p)=>{let s='';if(typeof p==='string')s=p;else if(p&&p.byteLength!==undefined)s=new TextDecoder().decode(p);else s=String(p);
+     let m;try{m=JSON.parse(s)}catch(_){return}onMsg(m,t)});
+    res(client)});
+   client.on('error',giveup);
+   client.on('close',()=>{if(!done&&!settled)giveup()})};
+  attempt()})}
+function publish(client,code,side,m){try{client.publish('rbn-nato/'+code+'/'+side,JSON.stringify(m),{qos:1})}catch(e){}}
+function addIce(pc,cand){if(!pc||!cand)return;try{pc.addIceCandidate(cand)}catch(e){}}
+function hostCreate(){showScreen('host');$('roomCode').textContent='····';$('hostStatus').className='status';$('hostStatus').textContent='Загрузка онлайн-модуля…';
+ ensureLib().then(async()=>{net.isHost=true;const code=makeCode();net.code=code;net.cid=makeCid();
   $('hostStatus').textContent='Регистрирую комнату…';
-  const peer=new Peer('rbn-v1-'+code);net.peer=peer;
-  peer.on('open',()=>{$('roomCode').textContent=code;$('hostStatus').textContent='Ждём друга… Отправь ему код или ссылку.';$('hostStatus').className='status ok'});
-  peer.on('connection',conn=>{
-   if(net.conn&&net.conn.open){conn.on('open',()=>{conn.send({t:'busy'});setTimeout(()=>conn.close(),300)});return}
-   net.conn=conn;setupConn(conn)});
-  peer.on('error',err=>{if(err.type==='unavailable-id'&&retry<4){try{peer.destroy()}catch(e){};hostCreate(retry+1)}
-   else{$('hostStatus').textContent=peerErrMsg(err.type);$('hostStatus').className='status err'}});
-  peer.on('disconnected',()=>{try{peer.reconnect()}catch(e){}});
+  try{await mqttConnect(code,m=>{if(m.cid===net.cid)return;
+   if(m.k==='offer'){
+    if(net.pc){if(m.cid!==net.peerCid)publish(net.mqtt,code,'host',{k:'busy',cid:net.cid});return}
+    net.peerCid=m.cid;net.remoteSet=false;net.iceBuf=[];
+    const pc=new RTCPeerConnection({iceServers:ICE_SERVERS});net.pc=pc;
+    pc.onicecandidate=e=>{if(e.candidate)publish(net.mqtt,code,'host',{k:'ice',cid:net.cid,cand:e.candidate})};
+    pc.ondatachannel=e=>{net.conn=wrapDC(e.channel);setupConn(net.conn);
+     net.conn.on('close',()=>{net.pc=null;net.peerCid=null;net.conn=null;net.remoteSet=false;net.iceBuf=[]})};
+    (async()=>{try{await pc.setRemoteDescription(m.sdp);net.remoteSet=true;net.iceBuf.forEach(c=>addIce(pc,c));net.iceBuf=[];
+     const a=await pc.createAnswer();await pc.setLocalDescription(a);
+     publish(net.mqtt,code,'host',{k:'answer',cid:net.cid,sdp:pc.localDescription})}catch(e){}})();
+   }else if(m.k==='ice'){if(net.pc&&net.remoteSet)addIce(net.pc,m.cand);else net.iceBuf.push(m.cand)}
+  })}catch(e){$('hostStatus').textContent='Сервер сигнала недоступен. Проверь интернет и попробуй ещё раз.';$('hostStatus').className='status err';return}
+  $('roomCode').textContent=code;$('hostStatus').textContent='Ждём друга… Отправь ему код или ссылку.';$('hostStatus').className='status ok';
  }).catch(()=>{$('hostStatus').textContent='Онлайн-модуль не загрузился (нужен интернет). Хот-сит и бот работают офлайн.';$('hostStatus').className='status err'})}
 function joinRoom(code){showScreen('join');$('joinStatus').className='status';$('joinStatus').textContent='Загрузка онлайн-модуля…';
- ensurePeerLib().then(()=>{net.isHost=false;net.code=code;
+ ensureLib().then(async()=>{net.isHost=false;net.code=code;net.cid=makeCid();
   $('joinStatus').textContent='Ищу комнату '+code+'…';
-  const peer=new Peer();net.peer=peer;let opened=false;
+  try{await mqttConnect(code,m=>{if(m.cid===net.cid)return;
+   if(m.k==='answer'){clearInterval(net.offerTimer);
+    if(net.pc){(async()=>{try{await net.pc.setRemoteDescription(m.sdp)}catch(e){};net.remoteSet=true;net.iceBuf.forEach(c=>addIce(net.pc,c));net.iceBuf=[]})()}}
+   else if(m.k==='ice'){if(net.pc&&net.remoteSet)addIce(net.pc,m.cand);else net.iceBuf.push(m.cand)}
+   else if(m.k==='busy'){if(net.conn&&net.conn.open)return;clearInterval(net.offerTimer);$('joinStatus').textContent='Комната занята — там уже двое.';$('joinStatus').className='status err';cleanupNet()}
+  })}catch(e){$('joinStatus').textContent='Сервер сигнала недоступен. Проверь интернет.';$('joinStatus').className='status err';return}
+  const pc=new RTCPeerConnection({iceServers:ICE_SERVERS});net.pc=pc;let opened=false;net.remoteSet=false;net.iceBuf=[];
+  const dc=pc.createDataChannel('rbn',{ordered:true});net.conn=wrapDC(dc);
+  dc.addEventListener('open',()=>{opened=true;clearTimeout(net.joinTimeout);clearInterval(net.offerTimer);setupConn(net.conn);
+   const nm=($('joinName').value.trim()||'ШТУРМ-2').slice(0,12);myName=nm;LS.set('rbn_name',nm);
+   netSend({t:'hello',name:nm})});
+  dc.addEventListener('error',()=>{if(!opened){$('joinStatus').textContent='Ошибка канала данных.';$('joinStatus').className='status err'}});
+  pc.onicecandidate=e=>{if(e.candidate)publish(net.mqtt,code,'guest',{k:'ice',cid:net.cid,cand:e.candidate})};
   net.joinTimeout=setTimeout(()=>{if(!opened){$('joinStatus').textContent='Не удалось соединиться за 15с. Возможно, жёсткий NAT/файрвол. Попробуйте другую сеть или хот-сит.';$('joinStatus').className='status err';cleanupNet()}},15000);
-  peer.on('open',()=>{const conn=peer.connect('rbn-v1-'+code,{reliable:true});net.conn=conn;
-   conn.on('open',()=>{opened=true;clearTimeout(net.joinTimeout);setupConn(conn);
-    const nm=($('joinName').value.trim()||'ШТУРМ-2').slice(0,12);myName=nm;LS.set('rbn_name',nm);
-    conn.send({t:'hello',name:nm})});
-   conn.on('error',()=>{if(!opened){$('joinStatus').textContent='Ошибка канала данных.';$('joinStatus').className='status err'}})});
-  peer.on('error',err=>{clearTimeout(net.joinTimeout);$('joinStatus').textContent=peerErrMsg(err.type);$('joinStatus').className='status err'});
+  (async()=>{try{const o=await pc.createOffer();await pc.setLocalDescription(o);
+   const sdp=pc.localDescription;
+   const send=()=>publish(net.mqtt,code,'guest',{k:'offer',cid:net.cid,sdp});
+   send();net.offerTimer=setInterval(()=>{if(!opened&&!net.remoteSet)send()},900)}catch(e){}})();
  }).catch(()=>{$('joinStatus').textContent='Онлайн-модуль не загрузился (нужен интернет).';$('joinStatus').className='status err'})}
 function setupConn(conn){
  net.pingTimer=setInterval(()=>netSend({t:'ping',ts:performance.now()}),2000);
